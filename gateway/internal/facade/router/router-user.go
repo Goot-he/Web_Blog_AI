@@ -1,0 +1,33 @@
+package router
+
+import (
+	"gateway/internal/facade/controller"
+
+	"github.com/gin-gonic/gin"
+)
+
+func NewUserRouter(v *gin.RouterGroup, userCtrl *controller.UserController, authMiddleware gin.HandlerFunc, roleMiddleware gin.HandlerFunc) {
+	// 用户主页
+	v.GET("/user/profile/:id", userCtrl.GetVisitorProfile)
+	v.GET("/user/list", userCtrl.PublicUserList)
+
+	// 用户信息修改
+	user := v.Group("/user")
+	user.Use(authMiddleware)
+	{
+		user.GET("/profile", userCtrl.GetProfile)
+		user.PUT("/profile", userCtrl.UpdateProfile)
+		user.PUT("/avatar", userCtrl.UpdateAvatar)
+	}
+
+	// 管理员对用户信息的操作
+	admin := v.Group("/admin")
+	admin.Use(authMiddleware)
+	admin.Use(roleMiddleware)
+	{
+		admin.GET("/list", userCtrl.UserList)
+		admin.GET("/search", userCtrl.SearchUser)
+		admin.PUT("/blacklist/add", userCtrl.AddBlacklist)
+		admin.PUT("/blacklist/remove", userCtrl.RemoveBlacklist)
+	}
+}

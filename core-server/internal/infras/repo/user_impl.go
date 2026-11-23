@@ -1,0 +1,300 @@
+package repo
+
+import (
+	"context"
+	"core-server/internal/infras/repo/ent"
+	"core-server/internal/infras/repo/ent/user"
+	"core-server/internal/infras/repo/ent/userstat"
+	"core-server/internal/model/aggregate"
+	"core-server/internal/model/entity"
+	"core-server/internal/model/enum"
+)
+
+type UserRepo struct {
+	*EntClient
+}
+
+func NewUserRepo(client *EntClient) *UserRepo {
+	return &UserRepo{
+		EntClient: client,
+	}
+}
+
+func (r *UserRepo) GetByID(ctx context.Context, id uint64) (*entity.User, error) {
+	node, err := r.db.User.Query().
+		Where(user.IDEQ(id), user.DeletedAtIsNil()).
+		Only(ctx)
+	if err != nil {
+		if ent.IsNotFound(err) {
+			return nil, ErrUserNotFound
+		}
+		return nil, err
+	}
+	return toEntityUser(node), nil
+}
+
+func (r *UserRepo) GetByName(ctx context.Context, name string) (*entity.User, error) {
+	node, err := r.db.User.Query().
+		Where(user.NameEQ(name), user.DeletedAtIsNil()).
+		Only(ctx)
+	if err != nil {
+		if ent.IsNotFound(err) {
+			return nil, ErrUserNotFound
+		}
+		return nil, err
+	}
+	return toEntityUser(node), nil
+}
+
+func (r *UserRepo) GetByEmail(ctx context.Context, email string) (*entity.User, error) {
+	node, err := r.db.User.Query().
+		Where(user.EmailEQ(email), user.DeletedAtIsNil()).
+		Only(ctx)
+	if err != nil {
+		if ent.IsNotFound(err) {
+			return nil, ErrUserNotFound
+		}
+		return nil, err
+	}
+	return toEntityUser(node), nil
+}
+
+func (r *UserRepo) GetUserStatByID(ctx context.Context, id uint64) (*aggregate.UserAggregate, error) {
+	node, err := r.db.User.Query().
+		Where(user.IDEQ(id), user.DeletedAtIsNil()).
+		WithStat(). // 预加载边
+		Only(ctx)
+	if err != nil {
+		if ent.IsNotFound(err) {
+			return nil, ErrUserNotFound
+		}
+		return nil, err
+	}
+
+	// 拿到关联的 stat
+	stat := node.Edges.Stat
+
+	return &aggregate.UserAggregate{
+		User: toEntityUser(node),
+		Stat: toEntityUserStat(stat),
+	}, err
+}
+
+func (r *UserRepo) Search(ctx context.Context, keyword string, limit, offset int32) ([]*entity.User, uint64, error) {
+	query := r.db.User.Query().Where(
+		user.DeletedAtIsNil(),
+		user.Or(user.NameContains(keyword), user.EmailContains(keyword)),
+	)
+
+	total, err := query.Clone().Count(ctx)
+	if err != nil {
+		return nil, 0, err
+	}
+	nodes, err := query.Order(ent.Desc(user.FieldID)).Limit(int(limit)).Offset(int(offset)).All(ctx)
+	if err != nil {
+		return nil, 0, err
+	}
+	return toEntityUsers(nodes), uint64(total), nil
+}
+
+func (r *UserRepo) List(ctx context.Context, limit, offset int32) ([]*entity.User, uint64, error) {
+	query := r.db.User.Query().Where(user.DeletedAtIsNil())
+	total, err := query.Clone().Count(ctx)
+	if err != nil {
+		return nil, 0, err
+	}
+	nodes, err := query.Order(ent.Desc(user.FieldID)).Limit(int(limit)).Offset(int(offset)).All(ctx)
+	if err != nil {
+		return nil, 0, err
+	}
+	return toEntityUsers(nodes), uint64(total), nil
+}
+
+// =====================================================================================================================
+
+func (r *UserRepo) CreateUser(ctx context.Context, value *entity.User) error {
+	err := r.WithTransaction(ctx, func(ctx context.Context) error {
+		node, err := r.db.User.Create().
+			SetName(value.Name).
+			SetPassword(value.Password).
+			SetEmail(value.Email).
+			SetRole(user.Role(value.Role.String())).
+			SetStatus(user.Status(value.Status.String())).
+			SetSignature(value.Signature).
+			Save(ctx)
+		if err != nil {
+			return err
+		}
+
+		_, err = r.db.UserStat.Create().
+			SetUserID(node.ID).
+			SetArticleCount(0).
+			SetViewCount(0).
+			SetFollowersCount(0).
+			SetFollowingCount(0).
+			SetLikeCount(0).
+			SetReceiveLikeCount(0).
+			SetFavorCount(0).
+			SetReceiveFavorCount(0).
+			SetReceiveCommentCount(0).
+			Save(ctx)
+		if err != nil {
+			return err
+		}
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+func (r *UserRepo) UpdateLikeCount(ctx context.Context, userID uint64, delta int64) error {
+	if delta == 0 {
+		return nil
+	}
+
+	update := r.DB(ctx).UserStat.Update().
+		Where(userstat.UserIDEQ(userID), userstat.DeletedAtIsNil())
+	if delta < 0 {
+		update.Where(userstat.LikeCountGT(0))
+	}
+	return update.AddLikeCount(delta).Exec(ctx)
+}
+
+func (r *UserRepo) UpdateFavorCount(ctx context.Context, userID uint64, delta int64) error {
+	if delta == 0 {
+		return nil
+	}
+	update := r.DB(ctx).UserStat.Update().Where(userstat.UserIDEQ(userID), userstat.DeletedAtIsNil())
+	if delta < 0 {
+		update.Where(userstat.FavorCountGT(0))
+	}
+	return update.AddFavorCount(delta).Exec(ctx)
+}
+
+func (r *UserRepo) UpdateReceiveLikeCount(ctx context.Context, userID uint64, delta int64) error {
+	if delta == 0 {
+		return nil
+	}
+
+	update := r.DB(ctx).UserStat.Update().
+		Where(userstat.UserIDEQ(userID), userstat.DeletedAtIsNil())
+	if delta < 0 {
+		update.Where(userstat.ReceiveLikeCountGT(0))
+	}
+	return update.AddReceiveLikeCount(delta).Exec(ctx)
+}
+
+func (r *UserRepo) UpdateReceiveFavorCount(ctx context.Context, userID uint64, delta int64) error {
+	if delta == 0 {
+		return nil
+	}
+	update := r.DB(ctx).UserStat.Update().Where(userstat.UserIDEQ(userID), userstat.DeletedAtIsNil())
+	if delta < 0 {
+		update.Where(userstat.ReceiveFavorCountGT(0))
+	}
+	return update.AddReceiveFavorCount(delta).Exec(ctx)
+}
+
+func (r *UserRepo) UpdateArticleCount(ctx context.Context, userID uint64, delta int64) error {
+	if delta == 0 {
+		return nil
+	}
+
+	update := r.DB(ctx).UserStat.Update().
+		Where(userstat.UserIDEQ(userID), userstat.DeletedAtIsNil())
+	if delta < 0 {
+		update.Where(userstat.ArticleCountGT(0))
+	}
+	return update.AddArticleCount(delta).Exec(ctx)
+}
+
+func (r *UserRepo) UpdateViewCount(ctx context.Context, userID uint64, delta int64) error {
+	if delta == 0 {
+		return nil
+	}
+
+	update := r.DB(ctx).UserStat.Update().
+		Where(userstat.UserIDEQ(userID), userstat.DeletedAtIsNil())
+	if delta < 0 {
+		update.Where(userstat.ViewCountGT(0))
+	}
+	return update.AddViewCount(delta).Exec(ctx)
+}
+
+func (r *UserRepo) UpdateReceiveCommentCount(ctx context.Context, userID uint64, delta int64) error {
+	if delta == 0 {
+		return nil
+	}
+
+	update := r.DB(ctx).UserStat.Update().
+		Where(userstat.UserIDEQ(userID), userstat.DeletedAtIsNil())
+	if delta < 0 {
+		update.Where(userstat.ReceiveCommentCountGT(0))
+	}
+	return update.AddReceiveCommentCount(delta).Exec(ctx)
+}
+
+func (r *UserRepo) UpdateFollowersCount(ctx context.Context, userID uint64, delta int64) error {
+	if delta == 0 {
+		return nil
+	}
+	update := r.DB(ctx).UserStat.Update().Where(userstat.UserIDEQ(userID), userstat.DeletedAtIsNil())
+	if delta < 0 {
+		update.Where(userstat.FollowersCountGT(0))
+	}
+	return update.AddFollowersCount(delta).Exec(ctx)
+}
+func (r *UserRepo) UpdateFollowingCount(ctx context.Context, userID uint64, delta int64) error {
+	if delta == 0 {
+		return nil
+	}
+	update := r.DB(ctx).UserStat.Update().Where(userstat.UserIDEQ(userID), userstat.DeletedAtIsNil())
+	if delta < 0 {
+		update.Where(userstat.FollowingCountGT(0))
+	}
+	return update.AddFollowingCount(delta).Exec(ctx)
+}
+
+// =====================================================================================================================
+
+func (r *UserRepo) UpdateProfile(ctx context.Context, value *entity.User) error {
+	update := r.db.User.Update().
+		Where(user.IDEQ(value.ID), user.DeletedAtIsNil()).
+		SetName(value.Name).
+		SetPhone(value.Phone).
+		SetSex(user.Sex(value.Sex)).
+		SetSignature(value.Signature)
+	if value.Birthday.IsZero() {
+		update.ClearBirthday()
+	} else {
+		update.SetBirthday(value.Birthday)
+	}
+	_, err := update.Save(ctx)
+	return err
+}
+
+func (r *UserRepo) UpdateAvatar(ctx context.Context, userID uint64, avatar string) error {
+	_, err := r.db.User.Update().
+		Where(user.IDEQ(userID), user.DeletedAtIsNil()).
+		SetAvatar(avatar).
+		Save(ctx)
+	return err
+}
+
+func (r *UserRepo) UpdatePassword(ctx context.Context, userID uint64, password string) error {
+	err := r.db.User.UpdateOneID(userID).SetPassword(password).Exec(ctx)
+	if ent.IsNotFound(err) {
+		return ErrUserNotFound
+	}
+	return err
+}
+
+func (r *UserRepo) UpdateStatus(ctx context.Context, userID uint64, status enum.UserStatus) error {
+	err := r.db.User.UpdateOneID(userID).
+		Where(user.DeletedAtIsNil()).
+		SetStatus(user.Status(status.String())).
+		Exec(ctx)
+	return err
+}

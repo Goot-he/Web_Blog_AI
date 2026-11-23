@@ -1,0 +1,177 @@
+package controller
+
+import (
+	"gateway/internal/application/user-module"
+	"gateway/internal/config"
+	"gateway/internal/facade/middleware"
+	"gateway/internal/model/dto"
+	"gateway/internal/model/reponse"
+	"gateway/internal/utils/vaildate"
+	"strconv"
+
+	"github.com/gin-gonic/gin"
+)
+
+type UserController struct {
+	svc *user_module.UserService
+	cfg *config.Config
+}
+
+func NewUserController(svc *user_module.UserService, cfg *config.Config) *UserController {
+	return &UserController{
+		svc: svc,
+		cfg: cfg,
+	}
+}
+
+func (u *UserController) GetProfile(c *gin.Context) {
+	userID, ok := middleware.GetUserID(c)
+	if !ok {
+		reponse.Unauthorized(c)
+		return
+	}
+	result, err := u.svc.GetProfile(c.Request.Context(), userID)
+	if err != nil {
+		reponse.InternalServerError(c, err.Error())
+		return
+	}
+	reponse.Success(c, result)
+}
+
+func (u *UserController) GetVisitorProfile(c *gin.Context) {
+	userID, err := strconv.ParseUint(c.Param("id"), 10, 64)
+	if err != nil || userID == 0 {
+		reponse.StatusBadRequest(c)
+		return
+	}
+	result, err := u.svc.GetVisitorProfile(c.Request.Context(), userID)
+	if err != nil {
+		reponse.InternalServerError(c, err.Error())
+		return
+	}
+	reponse.Success(c, result)
+}
+
+func (u *UserController) PublicUserList(c *gin.Context) {
+	page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
+	pageSize, _ := strconv.Atoi(c.DefaultQuery("pageSize", "20"))
+
+	res, err := u.svc.PublicUserList(c.Request.Context(), &dto.UserListRequest{
+		Page:     vaildate.Page(page),
+		PageSize: vaildate.PageSize(pageSize),
+	})
+	if err != nil {
+		reponse.InternalServerError(c, err.Error())
+		return
+	}
+	reponse.Success(c, res)
+}
+
+func (u *UserController) UpdateProfile(c *gin.Context) {
+	userID, ok := middleware.GetUserID(c)
+	if !ok {
+		reponse.Unauthorized(c)
+		return
+	}
+
+	var req dto.UpdateProfileRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		reponse.StatusBadRequest(c)
+		return
+	}
+	req.UserID = userID
+
+	err := u.svc.UpdateProfile(c.Request.Context(), req)
+	if err != nil {
+		reponse.InternalServerError(c, err.Error())
+		return
+	}
+	reponse.Success(c, nil)
+}
+
+func (u *UserController) UpdateAvatar(c *gin.Context) {
+	userID, ok := middleware.GetUserID(c)
+	if !ok {
+		reponse.Unauthorized(c)
+		return
+	}
+
+	file, err := c.FormFile("file")
+	if err != nil {
+		reponse.StatusBadRequest(c)
+		return
+	}
+
+	result, err := u.svc.UpdateAvatar(c.Request.Context(), &dto.UserAvatarRequest{
+		UserID: userID,
+		File:   file,
+	})
+	if err != nil {
+		reponse.InternalServerError(c, err.Error())
+		return
+	}
+	reponse.Success(c, result)
+}
+
+func (u *UserController) UserList(c *gin.Context) {
+	page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
+	pageSize, _ := strconv.Atoi(c.DefaultQuery("pageSize", "20"))
+
+	res, err := u.svc.UserList(c.Request.Context(), &dto.UserListRequest{
+		Page:     vaildate.Page(page),
+		PageSize: vaildate.PageSize(pageSize),
+	})
+	if err != nil {
+		reponse.InternalServerError(c, err.Error())
+		return
+	}
+	reponse.Success(c, res)
+}
+
+func (u *UserController) AddBlacklist(c *gin.Context) {
+	var req dto.UserBlacklistRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		reponse.StatusBadRequest(c)
+		return
+	}
+
+	err := u.svc.AddBlacklist(c.Request.Context(), &req)
+	if err != nil {
+		reponse.InternalServerError(c, err.Error())
+		return
+	}
+	reponse.Success(c, nil)
+}
+
+func (u *UserController) RemoveBlacklist(c *gin.Context) {
+	var req dto.UserBlacklistRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		reponse.StatusBadRequest(c)
+		return
+	}
+
+	err := u.svc.RemoveBlacklist(c.Request.Context(), &req)
+	if err != nil {
+		reponse.InternalServerError(c, err.Error())
+		return
+	}
+	reponse.Success(c, nil)
+}
+
+func (u *UserController) SearchUser(c *gin.Context) {
+	var req dto.UserSearchRequest
+	if err := c.ShouldBindQuery(&req); err != nil {
+		reponse.StatusBadRequest(c)
+		return
+	}
+
+	req.Page = vaildate.Page(req.Page)
+	req.PageSize = vaildate.Page(req.PageSize)
+
+	result, err := u.svc.SearchUser(c.Request.Context(), &req)
+	if err != nil {
+		reponse.InternalServerError(c, err.Error())
+		return
+	}
+	reponse.Success(c, result)
+}

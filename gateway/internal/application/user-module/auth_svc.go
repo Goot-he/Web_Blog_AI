@@ -1,0 +1,205 @@
+package user_module
+
+import (
+	"context"
+	"errors"
+	"gateway/internal/infras/clog"
+	"strings"
+
+	"gateway/internal/client/rpc"
+	"gateway/internal/client/rpc/core-rpc/authpb"
+	"gateway/internal/config"
+	"gateway/internal/infras/cache"
+	"gateway/internal/model/dto"
+	"gateway/internal/utils"
+
+	"go.uber.org/zap"
+)
+
+type AuthService struct {
+	cfg *config.Config
+	rpc *rpc.Client
+	log *clog.Log
+
+	blackList *cache.Blacklist
+	email     *utils.Email
+}
+
+func NewAuthService(
+	rpcClient *rpc.Client,
+	blackList *cache.Blacklist,
+	cfg *config.Config,
+	log *clog.Log,
+) *AuthService {
+	return &AuthService{
+		cfg:       cfg,
+		rpc:       rpcClient,
+		log:       log,
+		blackList: blackList,
+		email:     utils.NewEmail(cfg, blackList.Cache),
+	}
+}
+
+func (s *AuthService) SendEmailCode(ctx context.Context, req dto.SendEmailCodeRequest) error {
+	TimeOutCtx, cancel := context.WithTimeout(ctx, s.rpc.GetRequestTimeout())
+	defer cancel()
+
+	err := s.email.SendCode(TimeOutCtx, req.Email, req.Purpose)
+	if err != nil {
+		s.log.Error("AuthService/SendEmailCode error",
+			zap.String("Purpose:", req.Purpose),
+			zap.Error(err))
+		return err
+	}
+	return nil
+}
+
+func (s *AuthService) Register(ctx context.Context, req dto.RegisterRequest) error {
+	rpcCtx, cancel := context.WithTimeout(ctx, s.rpc.GetRequestTimeout())
+	defer cancel()
+
+	if err := s.email.VerifyCode(rpcCtx, req.Email, req.Code, "register"); err != nil {
+		s.log.Error("AuthService/Register error", zap.Error(err))
+		return err
+	}
+
+	if _, err := s.rpc.GetAuthClient().Register(rpcCtx, &authpb.RegisterRequest{
+		Username: req.Username,
+		Email:    req.Email,
+		Password: req.Password,
+	}); err != nil {
+		s.log.Error("AuthService/Register error", zap.Error(err))
+		return err
+	}
+
+	return nil
+}
+
+func (s *AuthService) Login(ctx context.Context, req dto.LoginRequest) (*dto.LoginResponse, error) {
+	rpcCtx, cancel := context.WithTimeout(ctx, s.rpc.GetRequestTimeout())
+	defer cancel()
+
+	resp, err := s.rpc.GetAuthClient().Login(rpcCtx, &authpb.LoginRequest{
+		Username: req.Username,
+		Password: req.Password,
+	})
+	if err != nil {
+		if isBusinessLoginError(err) {
+			s.log.Warn("AuthService/Login rejected", zap.Error(err))
+		} else {
+			s.log.Error("AuthService/Login error", zap.Error(err))
+		}
+		return nil, err
+	}
+	return s.createLoginResult(resp)
+}
+
+func (s *AuthService) EmailLogin(ctx context.Context, req dto.EmailLoginRequest) (*dto.LoginResponse, error) {
+	rpcCtx, cancel := context.WithTimeout(ctx, s.rpc.GetRequestTimeout())
+	defer cancel()
+
+	// 1. 校验验证码是否正确
+	if err := s.email.VerifyCode(rpcCtx, req.Email, req.Code, "login"); err != nil {
+		s.log.Error("AuthService/EmailLogin error", zap.Error(err))
+		return nil, err
+	}
+
+	// 2.调用rpc服务
+	resp, err := s.rpc.GetAuthClient().EmailLogin(rpcCtx, &authpb.EmailLoginRequest{Email: req.Email})
+	if err != nil {
+		if isBusinessLoginError(err) {
+			s.log.Warn("AuthService/EmailLogin rejected", zap.Error(err))
+		} else {
+			s.log.Error("AuthService/EmailLogin error", zap.Error(err))
+		}
+		return nil, err
+	}
+
+	// 3.准备token
+	return s.createLoginResult(resp)
+}
+
+func (s *AuthService) Logout(ctx context.Context, accessToken, refreshToken string) error {
+	rpcCtx, cancel := context.WithTimeout(ctx, s.rpc.GetRequestTimeout())
+	defer cancel()
+
+	// 直接从 authorization 提取 token
+	const prefix = "Bearer"
+
+	if err := s.blackList.AddToken(rpcCtx, strings.TrimPrefix(accessToken, prefix), s.cfg.Auth.AccessExpire); err != nil {
+		s.log.Error("AuthService/Logout error", zap.Error(err))
+		return err
+	}
+
+	if refreshToken != "" {
+		if err := s.blackList.AddToken(rpcCtx, refreshToken, s.cfg.Auth.RefreshExpire); err != nil {
+			s.log.Error("AuthService/Logout error", zap.Error(err))
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *AuthService) ForgotPassword(ctx context.Context, req dto.ForgotPasswordRequest) error {
+	rpcCtx, cancel := context.WithTimeout(ctx, s.rpc.GetRequestTimeout())
+	defer cancel()
+
+	if err := s.email.VerifyCode(rpcCtx, req.Email, req.Code, "forgot_password"); err != nil {
+		s.log.Error("AuthService/ForgotPassword error", zap.Error(err))
+		return err
+	}
+
+	if req.NewPassword != req.ConfirmPassword {
+		return errors.New("passwords do not match")
+	}
+
+	if _, err := s.rpc.GetAuthClient().ForgotPassword(rpcCtx, &authpb.ForgotPasswordRequest{
+		Email:           req.Email,
+		NewPassword:     req.NewPassword,
+		ConfirmPassword: req.ConfirmPassword,
+	}); err != nil {
+		s.log.Error("AuthService/ForgotPassword error", zap.Error(err))
+		return err
+	}
+	return nil
+}
+
+// =====================================================================================================================
+
+// isBusinessLoginError 判断是否为正常的登录失败（被拉黑、密码错误、账号不存在）。
+// 这类错误不应记录为 ERROR，否则会淹没真正的服务端故障。
+func isBusinessLoginError(err error) bool {
+	if err == nil {
+		return false
+	}
+	message := err.Error()
+	return strings.Contains(message, "USER_BLOCKED") ||
+		strings.Contains(message, "invalid username or password") ||
+		strings.Contains(message, "user not found")
+}
+
+func (s *AuthService) createLoginResult(user *authpb.LoginResponse) (*dto.LoginResponse, error) {
+	claims := utils.JWTClaims{
+		UserID: user.GetId(),
+		Role:   user.GetRole(),
+	}
+	accessToken, err := utils.CreateAccessToken([]byte(s.cfg.Auth.JWTSecret), claims, s.cfg.Auth.AccessExpire)
+	if err != nil {
+		return nil, err
+	}
+	refreshToken, err := utils.CreateRefreshToken([]byte(s.cfg.Auth.JWTSecret), claims, s.cfg.Auth.RefreshExpire)
+	if err != nil {
+		return nil, err
+	}
+
+	return &dto.LoginResponse{
+		AccessToken:   accessToken,
+		AccessExpires: s.cfg.Auth.AccessExpire,
+		RefreshToken:  refreshToken,
+		ID:            user.GetId(),
+		Username:      user.GetUsername(),
+		Avatar:        user.GetAvatar(),
+		Role:          user.GetRole(),
+		Status:        user.GetStatus(),
+	}, nil
+}

@@ -1,0 +1,369 @@
+package ai_module
+
+import (
+	"context"
+	"crypto/rand"
+	"encoding/hex"
+	"errors"
+	"fmt"
+	"gateway/internal/client/http"
+	"gateway/internal/config"
+	"gateway/internal/infras/api/llm"
+	"gateway/internal/infras/repo"
+	"gateway/internal/model/dto"
+	"gateway/internal/model/entity"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+)
+
+const (
+	defaultAiChatSessionTitle = "新建会话"
+	defaultEmptyRAGReply      = "目前没有该相关知识"
+	aiChatSystemPrompt        = `你的名字是「小爱」，是社团官网的ai助手`
+)
+
+var (
+	ErrAiChatMissingContent      = errors.New("content is required")
+	ErrAiChatMissingSessionID    = errors.New("session_id is required")
+	ErrAiChatMissingSessionTitle = errors.New("session title is required")
+	ErrAiChatSessionNotFound     = errors.New("session not found")
+)
+
+type AiChatService struct {
+	cfg        *config.Config
+	aiChatRepo *repo.AiChatRepo
+	vector     *http.PyClient
+	settingsMu sync.RWMutex
+	settings   aiChatRuntimeSettings
+}
+
+type aiChatRuntimeSettings struct {
+	assistantEnabled bool
+	provider         string
+	modelID          string
+	apiKey           string
+}
+
+func NewAiChatService(
+	cfg *config.Config,
+	aiChatRepo *repo.AiChatRepo,
+	vector *http.PyClient,
+) *AiChatService {
+	return &AiChatService{cfg: cfg,
+		aiChatRepo: aiChatRepo,
+		vector:     vector,
+		settings: aiChatRuntimeSettings{
+			assistantEnabled: cfg.AiChat.IsAssistantEnabled(),
+			provider:         cfg.LLM.Provider,
+			modelID:          cfg.LLM.ModelID,
+			apiKey:           cfg.LLM.APIKey,
+		},
+	}
+}
+
+var ErrAiChatDisabled = errors.New("assistant is disabled")
+
+func (s *AiChatService) GetStatus(ctx context.Context) *dto.AiChatStatusResponse {
+	settings := s.runtimeSettings()
+	return &dto.AiChatStatusResponse{AssistantEnabled: settings.assistantEnabled}
+}
+
+func (s *AiChatService) UpdateStatus(ctx context.Context, enabled bool) *dto.AiChatStatusResponse {
+	s.settingsMu.Lock()
+	s.settings.assistantEnabled = enabled
+	s.settingsMu.Unlock()
+	return s.GetStatus(ctx)
+}
+
+func (s *AiChatService) GetSettings(ctx context.Context) (*dto.AiSettingsResponse, error) {
+	settings := s.runtimeSettings()
+	return &dto.AiSettingsResponse{AssistantEnabled: settings.assistantEnabled, Provider: settings.provider, ModelID: settings.modelID, APIKey: settings.apiKey, APIKeyConfigured: strings.TrimSpace(settings.apiKey) != ""}, nil
+}
+
+func (s *AiChatService) UpdateSettings(ctx context.Context, req dto.UpdateAiSettingsRequest) (*dto.AiSettingsResponse, error) {
+	settings := s.runtimeSettings()
+	settings.provider = strings.TrimSpace(req.Provider)
+	settings.modelID = strings.TrimSpace(req.ModelID)
+	settings.apiKey = strings.TrimSpace(req.APIKey)
+	if settings.provider != "zhipu" && settings.provider != "zhipuai" {
+		return nil, errors.New("unsupported provider")
+	}
+	if settings.modelID == "" {
+		return nil, errors.New("model is required")
+	}
+	s.settingsMu.Lock()
+	s.settings = settings
+	s.settingsMu.Unlock()
+	return s.GetSettings(ctx)
+}
+
+func (s *AiChatService) runtimeSettings() aiChatRuntimeSettings {
+	s.settingsMu.RLock()
+	defer s.settingsMu.RUnlock()
+	return s.settings
+}
+
+// =====================================================================================================================
+// session
+
+func (s *AiChatService) CreateSession(ctx context.Context, userID uint64) (*dto.AiChatSessionResponse, error) {
+	settings := s.runtimeSettings()
+	if !settings.assistantEnabled {
+		return nil, ErrAiChatDisabled
+	}
+	session := &entity.AiChatSession{
+		UserID:    strconv.FormatUint(userID, 10),
+		SessionID: newSessionID(),
+		Title:     defaultAiChatSessionTitle,
+	}
+	if err := s.aiChatRepo.CreateSession(ctx, session); err != nil {
+		return nil, err
+	}
+	return dto.ToAiChatSessionResponse(session), nil
+}
+
+func (s *AiChatService) ListSessions(ctx context.Context, userID uint64) ([]*dto.AiChatSessionResponse, error) {
+	list, err := s.aiChatRepo.ListSessionsByUser(ctx, strconv.FormatUint(userID, 10))
+	if err != nil {
+		return nil, err
+	}
+	return dto.ToAiChatSessionResponses(list), nil
+}
+
+func (s *AiChatService) ListMessages(ctx context.Context, userID uint64, sessionID string) ([]*dto.AiChatMessageResponse, error) {
+	if err := s.ensureSessionOwner(ctx, userID, sessionID); err != nil {
+		return nil, err
+	}
+	list, err := s.aiChatRepo.ListMessagesBySession(ctx, sessionID)
+	if err != nil {
+		return nil, err
+	}
+	return dto.ToAiChatMessageResponses(list), nil
+}
+
+func (s *AiChatService) DeleteSession(ctx context.Context, userID uint64, sessionID string) error {
+	if strings.TrimSpace(sessionID) == "" {
+		return ErrAiChatMissingSessionID
+	}
+	if err := s.aiChatRepo.DeleteSessionByUser(ctx, strconv.FormatUint(userID, 10), sessionID); err != nil {
+		if errors.Is(err, repo.ErrAiChatSessionNotFound) {
+			return ErrAiChatSessionNotFound
+		}
+		return err
+	}
+	return nil
+}
+
+func (s *AiChatService) UpdateSession(ctx context.Context, userID uint64, sessionID, title string) (*dto.AiChatSessionResponse, error) {
+	if strings.TrimSpace(sessionID) == "" {
+		return nil, ErrAiChatMissingSessionID
+	}
+	title = strings.TrimSpace(title)
+	if title == "" {
+		return nil, ErrAiChatMissingSessionTitle
+	}
+	if len([]rune(title)) > 256 {
+		return nil, errors.New("session title is too long")
+	}
+	if err := s.aiChatRepo.UpdateSessionTitleByUser(ctx, strconv.FormatUint(userID, 10), sessionID, title); err != nil {
+		if errors.Is(err, repo.ErrAiChatSessionNotFound) {
+			return nil, ErrAiChatSessionNotFound
+		}
+		return nil, err
+	}
+	return &dto.AiChatSessionResponse{SessionID: sessionID, Title: title}, nil
+}
+
+// =====================================================================================================================
+// chat
+
+type AiChatStreamCallback func(chunk dto.AiChatStreamChunkResponse) error
+
+func (s *AiChatService) Chat(ctx context.Context, userID uint64, sessionID, content, collectionName string, callback AiChatStreamCallback) error {
+	settings := s.runtimeSettings()
+	if !settings.assistantEnabled {
+		return ErrAiChatDisabled
+	}
+	llmClient, err := llm.NewClient(&config.Config{LLM: config.LLMConfig{Provider: settings.provider, APIKey: settings.apiKey, APIURL: s.cfg.LLM.APIURL, ModelID: settings.modelID, ModelName: settings.modelID}})
+	if err != nil {
+		return err
+	}
+	if err := s.ensureSessionOwner(ctx, userID, sessionID); err != nil {
+		return err
+	}
+	// 1. 检索知识库
+	knowledgeContents, err := s.searchKnowledge(ctx, strings.TrimSpace(collectionName), content)
+	if err != nil {
+		return err
+	}
+
+	// 2. 拿到历史对话
+	history, err := s.aiChatRepo.ListMessagesBySession(ctx, sessionID)
+	if err != nil {
+		return err
+	}
+
+	// 3. 构建系统提示词和用户提示词
+	userPrompt, systemPrompt := buildAiChatPrompts(content, knowledgeContents, history)
+
+	// 4. 发送给llm模型生成内容
+	reply := strings.Builder{}
+	emit := func(content string, done bool) error {
+		if callback == nil {
+			return nil
+		}
+		chunk := dto.AiChatStreamChunkResponse{
+			SessionID: sessionID,
+			Content:   content,
+			Done:      done,
+		}
+		if done {
+			chunk.Knowledge = knowledgeContents
+		}
+		return callback(chunk)
+	}
+
+	streamErr := llmClient.ChatStream(ctx, systemPrompt, userPrompt, func(chunk string) error {
+		reply.WriteString(chunk)
+		return emit(chunk, false)
+	})
+	if streamErr != nil {
+		return streamErr
+	}
+
+	// 当模型返回空时
+	finalReply := strings.TrimSpace(reply.String())
+	if finalReply == "" {
+		finalReply = defaultEmptyRAGReply
+		if err := emit(finalReply, false); err != nil {
+			return err
+		}
+		reply.Reset()
+		reply.WriteString(finalReply)
+	}
+
+	if err := emit("", true); err != nil {
+		return err
+	}
+
+	// 5.保存记录
+	return s.saveChatRecords(ctx, strconv.FormatUint(userID, 10), sessionID, content, reply.String())
+}
+
+func (s *AiChatService) ensureSessionOwner(ctx context.Context, userID uint64, sessionID string) error {
+	if strings.TrimSpace(sessionID) == "" {
+		return ErrAiChatMissingSessionID
+	}
+	_, err := s.aiChatRepo.GetSessionByUser(ctx, strconv.FormatUint(userID, 10), sessionID)
+	if errors.Is(err, repo.ErrAiChatSessionNotFound) {
+		return ErrAiChatSessionNotFound
+	}
+	return err
+}
+
+func (s *AiChatService) saveChatRecords(ctx context.Context, userID, sessionID, content, reply string) error {
+	messages := []*entity.AiChatMessage{
+		{
+			SessionID: sessionID,
+			UserID:    userID,
+			Role:      entity.AiChatRoleUser,
+			Content:   content,
+		},
+		{
+			SessionID: sessionID,
+			UserID:    userID,
+			Role:      entity.AiChatRoleAssistant,
+			Content:   reply,
+		},
+	}
+	if err := s.aiChatRepo.CreateMessages(ctx, messages); err != nil {
+		return err
+	}
+	return s.aiChatRepo.TouchSession(ctx, sessionID)
+}
+
+func (s *AiChatService) searchKnowledge(ctx context.Context, collection, content string) ([]string, error) {
+	if collection == "" {
+		return nil, errors.New("collection_name is required")
+	}
+	topK := s.cfg.AiChat.DefaultTopK
+	if topK <= 0 {
+		topK = 5
+	}
+
+	resp, err := s.vector.SearchVectors(ctx, collection, &dto.DocsSearchRequest{
+		Content: content,
+		TopK:    &topK,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	contents := make([]string, 0, len(resp.Data))
+	for _, item := range resp.Data {
+		knowledgeContent := strings.TrimSpace(item.Content)
+		if knowledgeContent == "" {
+			continue
+		}
+		contents = append(contents, knowledgeContent)
+	}
+	return contents, nil
+}
+
+func buildAiChatPrompts(question string, knowledgeContents []string, history []*entity.AiChatMessage) (userPrompt, systemPrompt string) {
+	var systemBuilder strings.Builder
+	systemBuilder.WriteString(aiChatSystemPrompt)
+
+	// 1. 拼接RAG知识
+	systemBuilder.WriteString("\n# RAG检索知识\n")
+	if len(knowledgeContents) == 0 {
+		systemBuilder.WriteString("（暂无匹配知识）\n")
+	} else {
+		for i, knowledgeContent := range knowledgeContents {
+			systemBuilder.WriteString("[知识 kb-")
+			systemBuilder.WriteString(strconv.Itoa(i + 1))
+			systemBuilder.WriteString("] ")
+			systemBuilder.WriteString(knowledgeContent)
+			systemBuilder.WriteString("\n")
+		}
+	}
+	systemBuilder.WriteString("\n")
+
+	// 2. 拼接历史会话
+	systemBuilder.WriteString("# 历史会话\n")
+	if len(history) == 0 {
+		systemBuilder.WriteString("（无）\n")
+	} else {
+		for _, record := range history {
+			if record == nil || strings.TrimSpace(record.Content) == "" {
+				continue
+			}
+			role := "你"
+			if record.Role == entity.AiChatRoleUser {
+				role = "用户"
+			}
+			systemBuilder.WriteString(role)
+			systemBuilder.WriteString("：")
+			systemBuilder.WriteString(record.Content)
+			systemBuilder.WriteString("\n")
+		}
+	}
+
+	// 3.构建用户提示词
+	var userBuilder strings.Builder
+	userBuilder.WriteString("# 用户问题\n")
+	userBuilder.WriteString(question)
+	userBuilder.WriteString("\n\n请根据以上RAG检索知识与历史会话，以小驭的身份生成可直接发送给用户的回复。")
+
+	return userBuilder.String(), systemBuilder.String()
+}
+
+func newSessionID() string {
+	buf := make([]byte, 16)
+	if _, err := rand.Read(buf); err != nil {
+		return fmt.Sprintf("%d", time.Now().UnixNano())
+	}
+	return hex.EncodeToString(buf)
+}

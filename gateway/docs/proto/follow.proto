@@ -1,0 +1,17 @@
+syntax = "proto3";
+package follow;
+option go_package = "gateway/internal/client/rpc/core-rpc/followpb;followpb";
+import "user.proto";
+message FollowRequest { uint64 user_id = 1; uint64 target_user_id = 2; }
+message FollowResponse { bool success = 1; }
+message HasFollowRequest { uint64 user_id = 1; uint64 target_user_id = 2; }
+message HasFollowResponse { bool is_following = 1; }
+message ListFollowRequest { uint64 user_id = 1; int32 page = 2; int32 page_size = 3; }
+message ListFollowResponse { repeated user.UserInfo users = 1; uint64 total = 2; }
+service FollowService {
+ rpc Follow(FollowRequest) returns (FollowResponse);
+ rpc Unfollow(FollowRequest) returns (FollowResponse);
+ rpc HasFollow(HasFollowRequest) returns (HasFollowResponse);
+ rpc ListFollowing(ListFollowRequest) returns (ListFollowResponse);
+ rpc ListFollowers(ListFollowRequest) returns (ListFollowResponse);
+}

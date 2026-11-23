@@ -1,0 +1,188 @@
+package controller
+
+import (
+	"errors"
+	ai_module "gateway/internal/application/ai-module"
+	"gateway/internal/facade/middleware"
+	"gateway/internal/model/dto"
+	"gateway/internal/model/reponse"
+	"log"
+
+	"github.com/gin-gonic/gin"
+)
+
+type AiChatController struct{ svc *ai_module.AiChatService }
+
+func NewAiChatController(svc *ai_module.AiChatService) *AiChatController {
+	return &AiChatController{svc: svc}
+}
+
+// =====================================================================================================================
+// 会话方面
+
+func (ct *AiChatController) CreateSession(c *gin.Context) {
+	userID, ok := middleware.GetUserID(c)
+	if !ok {
+		reponse.Unauthorized(c)
+		return
+	}
+	session, err := ct.svc.CreateSession(c.Request.Context(), userID)
+	if err != nil {
+		aiChatError(c, err)
+		return
+	}
+	reponse.Success(c, session)
+}
+
+func (ct *AiChatController) ListSessions(c *gin.Context) {
+	userID, ok := middleware.GetUserID(c)
+	if !ok {
+		reponse.Unauthorized(c)
+		return
+	}
+	list, err := ct.svc.ListSessions(c.Request.Context(), userID)
+	if err != nil {
+		aiChatError(c, err)
+		return
+	}
+	reponse.Success(c, list)
+}
+
+func (ct *AiChatController) ListMessages(c *gin.Context) {
+	userID, ok := middleware.GetUserID(c)
+	if !ok {
+		reponse.Unauthorized(c)
+		return
+	}
+	list, err := ct.svc.ListMessages(c.Request.Context(), userID, c.Param("id"))
+	if err != nil {
+		aiChatError(c, err)
+		return
+	}
+	reponse.Success(c, list)
+}
+
+func (ct *AiChatController) DeleteSession(c *gin.Context) {
+	userID, ok := middleware.GetUserID(c)
+	if !ok {
+		reponse.Unauthorized(c)
+		return
+	}
+	if err := ct.svc.DeleteSession(c.Request.Context(), userID, c.Param("id")); err != nil {
+		aiChatError(c, err)
+		return
+	}
+	reponse.Success(c, nil)
+}
+
+func (ct *AiChatController) UpdateSession(c *gin.Context) {
+	userID, ok := middleware.GetUserID(c)
+	if !ok {
+		reponse.Unauthorized(c)
+		return
+	}
+	var input dto.AiChatUpdateSessionRequest
+	if err := c.ShouldBindJSON(&input); err != nil {
+		reponse.StatusBadRequest(c)
+		return
+	}
+	session, err := ct.svc.UpdateSession(c.Request.Context(), userID, c.Param("id"), input.Title)
+	if err != nil {
+		aiChatError(c, err)
+		return
+	}
+	reponse.Success(c, session)
+}
+
+// =====================================================================================================================
+// chat
+
+func (ct *AiChatController) Chat(c *gin.Context) {
+	var input dto.AiChatChatRequest
+	if err := c.ShouldBindJSON(&input); err != nil {
+		reponse.StatusBadRequest(c)
+		return
+	}
+	userID, ok := middleware.GetUserID(c)
+	if !ok {
+		reponse.Unauthorized(c)
+		return
+	}
+	c.Header("Content-Type", "text/event-stream")
+	c.Header("Cache-Control", "no-cache")
+	c.Header("Connection", "keep-alive")
+	c.Header("X-Accel-Buffering", "no")
+	if err := ct.svc.Chat(c.Request.Context(), userID, input.SessionID, input.Content, input.CollectionName, func(chunk dto.AiChatStreamChunkResponse) error {
+		c.SSEvent("message", chunk)
+		c.Writer.Flush()
+		return nil
+	}); err != nil {
+		log.Printf("ai chat stream failed: %v", err)
+		c.SSEvent("message", gin.H{"error": err.Error(), "done": true})
+		c.Writer.Flush()
+		return
+	}
+	c.SSEvent("message", "[DONE]")
+	c.Writer.Flush()
+}
+
+// =====================================================================================================================
+// settings
+
+func (ct *AiChatController) GetStatus(c *gin.Context) {
+	reponse.Success(c, ct.svc.GetStatus(c.Request.Context()))
+}
+
+func (ct *AiChatController) UpdateStatus(c *gin.Context) {
+	if middleware.GetRole(c) != "admin" {
+		reponse.Forbidden(c)
+		return
+	}
+	var input dto.UpdateAiChatStatusRequest
+	if err := c.ShouldBindJSON(&input); err != nil {
+		reponse.StatusBadRequest(c)
+		return
+	}
+	reponse.Success(c, ct.svc.UpdateStatus(c.Request.Context(), input.AssistantEnabled))
+}
+
+func (ct *AiChatController) GetSettings(c *gin.Context) {
+	if middleware.GetRole(c) != "admin" {
+		reponse.Forbidden(c)
+		return
+	}
+	settings, err := ct.svc.GetSettings(c.Request.Context())
+	if err != nil {
+		reponse.InternalServerError(c, err.Error())
+		return
+	}
+	reponse.Success(c, settings)
+}
+
+func (ct *AiChatController) UpdateSettings(c *gin.Context) {
+	if middleware.GetRole(c) != "admin" {
+		reponse.Forbidden(c)
+		return
+	}
+	var input dto.UpdateAiSettingsRequest
+	if err := c.ShouldBindJSON(&input); err != nil {
+		reponse.StatusBadRequest(c)
+		return
+	}
+	settings, err := ct.svc.UpdateSettings(c.Request.Context(), input)
+	if err != nil {
+		reponse.StatusBadRequest(c)
+		return
+	}
+	reponse.Success(c, settings)
+}
+
+func aiChatError(c *gin.Context, err error) {
+	switch {
+	case errors.Is(err, ai_module.ErrAiChatMissingContent), errors.Is(err, ai_module.ErrAiChatMissingSessionID), errors.Is(err, ai_module.ErrAiChatMissingSessionTitle), errors.Is(err, ai_module.ErrAiChatSessionNotFound), errors.Is(err, ai_module.ErrAiChatDisabled):
+		reponse.StatusBadRequest(c)
+	default:
+		log.Printf("ai chat request failed: %v", err)
+		reponse.InternalServerError(c, err.Error())
+	}
+}

@@ -1,0 +1,60 @@
+syntax = "proto3";
+
+import "article.proto";
+
+package favor;
+//import "idl/validate/validate.proto";
+option go_package = "core-server/internal/rpc/favorpb;favorpb";
+
+service FavorService {
+  rpc Favor(FavorRequest) returns (FavorResponse) {};
+  rpc CancelFavor(CancelFavorRequest) returns (FavorResponse) {};
+  rpc HasFavor(HasFavorRequest) returns (HasFavorResponse) {};
+  rpc PageQueryUserFavorList(PageQueryUserFavorListRequest) returns (PageQueryUserFavorListResponse) {};
+  rpc ListFavoriteFolders(ListFavoriteFoldersRequest) returns (ListFavoriteFoldersResponse) {};
+  rpc CreateFavoriteFolder(CreateFavoriteFolderRequest) returns (CreateFavoriteFolderResponse) {};
+  rpc DeleteFavoriteFolder(DeleteFavoriteFolderRequest) returns (FavorResponse) {};
+}
+
+message FavorRequest {
+  uint64 userID = 1;
+  uint64 objectID = 2;
+  uint64 folderID = 3;
+}
+
+message CancelFavorRequest {
+  uint64 userID = 1;
+  uint64 objectID = 2;
+}
+
+message FavorResponse {
+  bool success = 1;
+}
+
+message HasFavorRequest {
+  uint64 userID = 1;
+  uint64 objectID = 2;
+}
+
+message HasFavorResponse {
+  bool isFavored = 1;
+}
+
+message PageQueryUserFavorListRequest {
+  uint64 userID = 1;
+  uint32 page = 2;
+  uint32 pageSize = 3;
+  uint64 folderID = 4;
+}
+
+message PageQueryUserFavorListResponse {
+  repeated article.Article articles = 1;
+  int64 total = 2;
+}
+
+message FavoriteFolder { uint64 id = 1; string name = 2; bool isDefault = 3; int64 articleCount = 4; }
+message ListFavoriteFoldersRequest { uint64 userID = 1; }
+message ListFavoriteFoldersResponse { repeated FavoriteFolder folders = 1; }
+message CreateFavoriteFolderRequest { uint64 userID = 1; string name = 2; }
+message CreateFavoriteFolderResponse { FavoriteFolder folder = 1; }
+message DeleteFavoriteFolderRequest { uint64 userID = 1; uint64 folderID = 2; }

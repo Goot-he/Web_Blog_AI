@@ -1,0 +1,124 @@
+package dto
+
+import "gateway/internal/client/rpc/core-rpc/commentpb"
+
+type CreateCommentRequest struct {
+	ArticleID uint64 `json:"articleId" binding:"required"`
+	UserID    uint64 `json:"-"`
+	Content   string `json:"content" binding:"required"`
+}
+
+type CreateReplyRequest struct {
+	ArticleID uint64 `json:"articleId" binding:"required"`
+	ParentID  uint64 `json:"parentId" binding:"required"`
+	UserID    uint64 `json:"-"`
+	ReplyToID uint64 `json:"replyToId"`
+	Content   string `json:"content" binding:"required"`
+}
+
+type DeleteCommentRequest struct {
+	ID        uint64 `json:"id" binding:"required"`
+	ArticleID uint64 `json:"articleId" binding:"required"`
+	UserID    uint64 `json:"-"`
+}
+
+type DeleteReplyRequest struct {
+	ID        uint64 `json:"id" binding:"required"`
+	ArticleID uint64 `json:"articleId" binding:"required"`
+	UserID    uint64 `json:"-"`
+}
+
+type GetArticleCommentsRequest struct {
+	UserID    uint64 `json:"-"`
+	ArticleID uint64 `json:"articleId" binding:"required"`
+	Page      int32  `json:"page"`
+	Size      int32  `json:"size"`
+}
+
+type GetCommentRepliesRequest struct {
+	UserID   uint64 `json:"-"`
+	ParentID uint64 `json:"parentId" binding:"required"`
+	Page     int32  `json:"page"`
+	Size     int32  `json:"size"`
+}
+
+type CommentInfo struct {
+	ID              uint64 `json:"id"`
+	ArticleID       uint64 `json:"articleId"`
+	UserID          uint64 `json:"userId"`
+	ParentID        uint64 `json:"parentId"`
+	RootID          uint64 `json:"rootId"`
+	ReplyToID       uint64 `json:"replyToId"`
+	ReplyToUserName string `json:"replyToUserName"`
+	Content         string `json:"content"`
+	LikeCount       uint32 `json:"likeCount"`
+	ChildCount      uint32 `json:"childCount"`
+	CreatedAt       string `json:"createdAt"`
+	UserName        string `json:"userName"`
+	UserAvatar      string `json:"userAvatar"`
+	IsLiked         bool   `json:"isLiked"`
+}
+
+type CommentListResponse struct {
+	Comments []*CommentInfo `json:"comments"`
+	Page     int32          `json:"page"`
+	Size     int32          `json:"size"`
+}
+
+type CommentRepliesResponse struct {
+	Replies []*CommentInfo `json:"replies"`
+	Page    int32          `json:"page"`
+	Size    int32          `json:"size"`
+}
+
+type CommentBoolResponse struct {
+	Success bool `json:"success"`
+}
+
+func ToArticleCommentInfo(item *commentpb.ArticleCommentInfo) *CommentInfo {
+	if item == nil {
+		return nil
+	}
+	return &CommentInfo{
+		ID:         item.GetId(),
+		ArticleID:  item.GetArticleId(),
+		UserID:     item.GetUserId(),
+		ParentID:   item.GetRootId(),
+		RootID:     item.GetRootId(),
+		ReplyToID:  item.GetReplyToId(),
+		Content:    item.GetContent(),
+		LikeCount:  item.GetLikeCount(),
+		ChildCount: item.GetChildCount(),
+		CreatedAt:  item.GetCreatedAt(),
+		UserName:   item.GetUserName(),
+		UserAvatar: item.GetUserAvatar(),
+		IsLiked:    item.GetIsLiked(),
+	}
+}
+
+func ToReplyInfo(item *commentpb.ReplyInfo) *CommentInfo {
+	if item == nil {
+		return nil
+	}
+	return &CommentInfo{ID: item.GetId(), ArticleID: item.GetArticleId(), UserID: item.GetUserId(), ParentID: item.GetRootId(), RootID: item.GetRootId(), ReplyToID: item.GetReplyToId(), ReplyToUserName: item.GetReplyToUserName(), Content: item.GetContent(), LikeCount: item.GetLikeCount(), CreatedAt: item.GetCreatedAt(), UserName: item.GetUserName(), UserAvatar: item.GetUserAvatar(), IsLiked: item.GetIsLiked()}
+}
+
+func ToArticleCommentList(items []*commentpb.ArticleCommentInfo) []*CommentInfo {
+	result := make([]*CommentInfo, 0, len(items))
+	for _, item := range items {
+		result = append(result, ToArticleCommentInfo(item))
+	}
+	return result
+}
+
+func ToReplyList(items []*commentpb.ReplyInfo) []*CommentInfo {
+	result := make([]*CommentInfo, 0, len(items))
+	for _, item := range items {
+		result = append(result, ToReplyInfo(item))
+	}
+	return result
+}
+
+func ToCommentBoolResponse(success bool) *CommentBoolResponse {
+	return &CommentBoolResponse{Success: success}
+}
